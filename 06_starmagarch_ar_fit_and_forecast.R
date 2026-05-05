@@ -325,19 +325,54 @@ log_EWMA_var    <- log(pmax(EWMA_var, 1e-12))
 # 8. One-step-ahead recursive forecasting
 # ------------------------------------------------------------
 
-sigma_1step_ahead <- function(fit, Y_hist_NxT) {
+coef_to_parameter_list <- function(fit) {
+  cf <- fit$coefficients
+  
+  list(
+    mu    = unname(cf["mu"]),
+    phi   = matrix(unname(cf[grep("^phi", names(cf))]),   ncol = 1),
+    theta = matrix(unname(cf[grep("^theta", names(cf))]), ncol = 1),
+    omega = unname(cf["omega"]),
+    alpha = matrix(unname(cf[grep("^alpha", names(cf))]), ncol = 1),
+    beta  = matrix(unname(cf[grep("^beta", names(cf))]),  ncol = 1)
+  )
+}
+
+sigma_1step_ahead_fixed <- function(fit, Y_hist_NxT, W_dense) {
+  
   n <- nrow(Y_hist_NxT)
+  
+  # Add dummy future observation.
+  # This is only to allow TMB to compute sigma for the next time point.
   Y_ext <- cbind(Y_hist_NxT, rep(0, n))
   
-  sigma_ext <- tryCatch(
-    sigma(fit, newdata = Y_ext),
-    error = function(e) {
-      stop("sigma(fit, newdata = ...) failed.")
-    }
+  Warr <- array(as.matrix(W_dense), c(n, n, 1))
+  
+  pars_list <- coef_to_parameter_list(fit)
+  map <- parameterlist2maptemplate(pars_list)
+  
+  init_vec <- pmax(apply(Y_hist_NxT, 1, var), 1e-6)
+  
+  fobj_ext <- CreateLikelihood(
+    data       = Y_ext,
+    W          = Warr,
+    init       = init_vec,
+    parameters = pars_list,
+    map        = map,
+    silent     = TRUE
   )
   
-  as.numeric(sigma_ext[, ncol(sigma_ext)])
+  rep_ext <- fobj_ext$report(unname(fit$coefficients))
+  
+  # In fitSTARMAGARCH, sigma is stored as sqrt(report$sigma),
+  # so report$sigma is variance.
+  sig_ext <- sqrt(rep_ext$sigma)
+  
+  if (!is.matrix(sig_ext)) stop("sigma report is not a matrix.")
+  
+  as.numeric(sig_ext[, ncol(sig_ext)])
 }
+
 
 eval_metric <- function(h_var, proxy_log_var) {
   stopifnot(all(dim(h_var) == dim(proxy_log_var)))
@@ -351,31 +386,42 @@ eval_metric <- function(h_var, proxy_log_var) {
   )
 }
 
-forecast_results <- list()
+results_forecast_rec <- list()
 
 for (w_name in names(weight_matrices)) {
-  cat("Recursive forecasting for", w_name, "\n")
+  cat("\n=== Recursive forecasting for", w_name, "===\n")
   
-  fit_obj <- fits_list[[w_name]]$fit
-  forecasts <- matrix(NA_real_, nrow = test_length, ncol = N)
+  fit_fix <- fits_list[[w_name]]$fit
+  W_dense <- fits_list[[w_name]]$W_dense
   
-  for (j in seq_len(test_length)) {
-    t_index <- train_length + j
-    Y_hist <- t(D_full[1:(t_index - 1), , drop = FALSE])
-    sigma_next <- sigma_1step_ahead(fit_obj, Y_hist)
-    forecasts[j, ] <- sigma_next^2
+  forecasts <- matrix(NA_real_, nrow = out.l, ncol = N)
+  
+  for (j in 1:out.l) {
+    t_index <- train.l + j
+    
+    # Only observations available before the forecast target
+    Y_hist <- t(residuals_all[1:(t_index - 1), , drop = FALSE])
+    
+    sig_next <- sigma_1step_ahead_fixed(
+      fit        = fit_fix,
+      Y_hist_NxT = Y_hist,
+      W_dense    = W_dense
+    )
+    
+    forecasts[j, ] <- sig_next^2
   }
   
   metrics <- list(
-    RV_var      = eval_metric(forecasts, log_RV_var),
-    RV5_ms_var  = eval_metric(forecasts, log_RV5_ms_var),
-    RV5_abs_var = eval_metric(forecasts, log_RV5_abs_var),
-    EWMA_var    = eval_metric(forecasts, log_EWMA_var)
+    RV_var       = eval_metric(forecasts, log_RV_var),
+    RV5_abs_var  = eval_metric(forecasts, log_RV5_abs_var),
+    RV5_ms_var   = eval_metric(forecasts, log_RV5_ms_var),
+    EWMA_var     = eval_metric(forecasts, log_EWMA_var)
   )
   
-  forecast_results[[w_name]] <- list(
+  results_forecast_rec[[w_name]] <- list(
+    fit       = fits_list[[w_name]],
     forecasts = forecasts,
-    metrics = metrics
+    metrics   = metrics
   )
 }
 
